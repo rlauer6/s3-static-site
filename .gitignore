@@ -1,1 +1,3 @@
-blog/*.html
+logs/*
+deploy.log
+blog/*html

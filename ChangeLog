@@ -1,0 +1,18 @@
+Wed Feb 19 13:54:29 2025  Rob Lauer  <rlauer6@comcast.net>
+
+	* README.md
+	* s3-static-site.sh: renamed from s3-static-site
+	* update-route53.sh: rename from update-route53
+	* s3-bucket-unlock.sh: new
+	* blog/s3-static-site-1.md: removed
+
+Mon Feb 10 16:12:59 2025  Rob Lauer  <rlauer6@comcast.net>
+
+	[BigBang]:
+	* s3-static-site: new
+	* update-route53: new
+	* .gitignore: new
+	* README.md: new
+
+
+
