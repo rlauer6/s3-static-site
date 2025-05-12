@@ -41,29 +41,44 @@ get_cloudfront_distribution_by_tag() {
 get_cloudfront_dns_name() {
 ########################################################################
     local distribution_id="$1"
+    local aws_profile="$2"
 
     aws cloudfront get-distribution \
         --id "$distribution_id" \
         --query "Distribution.DomainName" \
         --output text \
-        --profile $AWS_PROFILE
+        --profile $aws_profile
 }
 
 ########################################################################
 usage() {
 ########################################################################
-    echo "Usage: $0 -d DISTRIBUTION_ID -t TAG_VALUE -p AWS_PROFILE -n SUBDOMAIN_NAME -z HOSTED_ZONE"
-    echo ""
-    echo "Options:"
-    echo "  -d    CloudFront distribution ID (e.g., E1XYZABCDEF)**"
-    echo "  -p    AWS Profile"
-    echo "  -t    Name tag value**"
-    echo "  -n    Subdomain name (e.g., cpan.example.com)"
-    echo "  -z    Route 53 hosted zone name (e.g., example.com)"
-    echo ""
-    echo "Example: $0 -t tbc-cpan-mirror -p prod -z treasurersbriefcase.com -n cpan.treasurersbriefcase.com"
-    echo ""
-    echo "** Provide either the distribution id of the CloudFront distribution or its Name tag"
+    cat <<EOF
+Usage: $0 -d DISTRIBUTION_ID -t TAG_VALUE -p AWS_PROFILE -n SUBDOMAIN_NAME -z HOSTED_ZONE
+
+Options:
+  -d    CloudFront distribution ID (e.g., E1XYZABCDEF)
+  -p    AWS Profile (for updating Route53) - required
+  -C    AWS Profile (for CloudFront distribution) - default: Route53 profile
+  -P    Indicates the Hosted Zone is public - default not public
+  -t    Name tag value** (required if distribution ID not provide)
+  -n    Subdomain name (e.g., cpan.example.com) - required
+  -z    Route 53 hosted zone name (e.g., example.com) - required
+
+Example: $0 -t tbc-cpan-mirror -p prod -z treasurersbriefcase.com -n cpan.treasurersbriefcase.com
+
+-----
+Notes
+-----
+
+1. Provide either the distribution id of the CloudFront distribution
+   or its Name tag
+
+2. Hosted zone is assumed to be private. Use the -P option if you have
+   both a public and private hosted zone and want you DNS name to be
+   public.
+
+EOF
     exit 1
 }
 
@@ -81,13 +96,15 @@ set -euo pipefail
 trap cleanup EXIT
 
 # Parse command-line arguments
-while getopts "d:p:n:z:a:t:h" opt; do
+while getopts "d:p:n:z:a:t:hPC:" opt; do
     case $opt in
+        C) CLOUDFRONT_PROFILE="$OPTARG" ;;
         d) DISTRIBUTION_ID="$OPTARG" ;;
         p) AWS_PROFILE="$OPTARG" ;;
         n) SUBDOMAIN_NAME="$OPTARG" ;;
         t) TAG_VALUE="$OPTARG" ;;
         z) HOSTED_ZONE_NAME="$OPTARG" ;;
+        P) PUBLIC="true";;
         h) usage ;;
         *) usage ;;
     esac
@@ -96,6 +113,7 @@ done
 TAG_VALUE=${TAG_VALUE:-};
 DISTRIBUTION_ID=${DISTRIBUTION_ID:-};
 ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text --profile $AWS_PROFILE)
+CLOUDFRONT_PROFILE=${CLOUDFRONT_PROFILE:-$AWS_PROFILE}
 
 # Validate required inputs
 if [[ -z "$TAG_VALUE$DISTRIBUTION_ID" || -z "${AWS_PROFILE:-}" || -z "${SUBDOMAIN_NAME:-}" || -z "${HOSTED_ZONE_NAME:-}" ]]; then
@@ -104,21 +122,26 @@ if [[ -z "$TAG_VALUE$DISTRIBUTION_ID" || -z "${AWS_PROFILE:-}" || -z "${SUBDOMAI
 fi
 
 if test -z "$DISTRIBUTION_ID"; then
-    DISTRIBUTION_ID=$(get_cloudfront_distribution_by_tag "$TAG_VALUE" "$AWS_PROFILE")
+    DISTRIBUTION_ID=$(get_cloudfront_distribution_by_tag "$TAG_VALUE" "$CLOUDFRONT_PROFILE")
+    if test -n "$DISTRIBUTION_ID"; then
+        echo "✅ Retrieved distribution id ($DISTRIBUTION_ID) from tag Name=$TAG_VALUE"
+    else
+        echo "❌ Error: Could not find distribution id from tag=$TAG_VALUE" >&2
+    fi
 fi
 
-if test -n "$DISTRIBUTION_ID"; then
-    echo "✅ Retrieved distribution id ($DISTRIBUTION_ID) from tag Name=$TAG_VALUE"
-else
-    echo "❌ Error: Could not find distribution id from tag=$TAG_VALUE" >&2
-fi
-
-CLOUDFRONT_DNS_NAME=$(get_cloudfront_dns_name "$DISTRIBUTION_ID")
+CLOUDFRONT_DNS_NAME=$(get_cloudfront_dns_name "$DISTRIBUTION_ID" "$CLOUDFRONT_PROFILE" )
 echo "✅ Retrieved DNS name ($CLOUDFRONT_DNS_NAME) from distribution id ($DISTRIBUTION_ID)"
 
 # Get the Hosted Zone ID
+if test -n "$PUBLIC"; then
+    PRIVATE="false";
+else
+    PRIVATE="true";
+fi
+
 HOSTED_ZONE_ID=$(aws route53 list-hosted-zones-by-name --dns-name "$HOSTED_ZONE_NAME" \
-    --query "HostedZones[?Config.PrivateZone == \`true\` && Name == \`$HOSTED_ZONE_NAME.\`].Id" \
+    --query "HostedZones[?Config.PrivateZone == \`$PRIVATE\` && Name == \`$HOSTED_ZONE_NAME.\`].Id" \
     --output text --profile "$AWS_PROFILE")
 
 if [[ -z "$HOSTED_ZONE_ID" ]]; then

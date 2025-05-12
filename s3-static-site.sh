@@ -6,44 +6,43 @@ set -o errexit -o nounset -o pipefail
 ########################################################################
 create_s3_bucket() {
 ########################################################################
-
-    # Check if the bucket already exists
-    BUCKET_EXISTS=$(run_command $AWS s3api head-bucket \
-                                --bucket $BUCKET_NAME \
-                                --profile $AWS_PROFILE || true)
-
-    if echo "$BUCKET_EXISTS" | grep -q '404'; then
-        echo "🛠️ Bucket does not exist. Creating..."
-        BUCKET_CONFIGURATION=$([ "$AWS_REGION" != "us-east-1" ] && echo "--create-bucket-configuration LocationConstraint=$AWS_REGION" || true)
-        run_command $AWS s3api create-bucket \
-                    --bucket $BUCKET_NAME \
-                    --region $AWS_REGION $BUCKET_CONFIGURATION \
-                    --profile $AWS_PROFILE
-    elif echo "$BUCKET_EXISTS" | grep -q '403'; then
-        echo "❌ Error: Bucket name exists but you do not have permission to access it."
-        exit 1
-    elif echo "$BUCKET_EXISTS" | grep -q '301'; then
-        echo "❌ Error: Bucket exists in a different region. Please check the region."
-        exit 1
-    else
+    if $AWS s3api head-bucket --bucket "$BUCKET_NAME" --profile "$AWS_PROFILE" 2>err.log; then
         echo "✅ Bucket already exists: $BUCKET_NAME" | tee -a "$LOG_FILE"
-    fi
+    else
+        err=$(<err.log)
+        if echo "$err" | grep -q '404'; then
+            echo "🛠️ Bucket does not exist. Creating..."
+            BUCKET_CONFIGURATION=$([ "$AWS_REGION" != "us-east-1" ] && echo "--create-bucket-configuration LocationConstraint=$AWS_REGION" || true)
+            run_command $AWS s3api create-bucket \
+                        --bucket "$BUCKET_NAME" \
+                        --region "$AWS_REGION" $BUCKET_CONFIGURATION \
+                        --profile "$AWS_PROFILE"
 
-    BUCKET_REGION=$(run_command $AWS s3api get-bucket-location \
-                         --bucket "$BUCKET_NAME" \
-                         --profile "$AWS_PROFILE" \
-                         --query "LocationConstraint" \
-                         --output text || true)
+            # Wait for the bucket to become consistently available
+            for i in {1..5}; do
+                sleep 2
+                if $AWS s3api head-bucket --bucket "$BUCKET_NAME" --profile "$AWS_PROFILE" 2>/dev/null; then
+                    echo "✅ Bucket is now available." | tee -a "$LOG_FILE"
+                    break
+                fi
+                echo "⏳ Waiting for S3 bucket to propagate (attempt $i)..." | tee -a "$LOG_FILE"
+            done
 
-    echo "[$BUCKET_REGION]"
+            if ! $AWS s3api head-bucket --bucket "$BUCKET_NAME" --profile "$AWS_PROFILE" 2>/dev/null; then
+                echo "❌ Bucket failed to become available after creation." | tee -a "$LOG_FILE"
+                exit 1
+            fi
 
-    if [ "$BUCKET_REGION" = "None" ]; then
-        BUCKET_REGION="us-east-1"  # AWS returns null for us-east-1
-    fi
-
-    if [ "$BUCKET_REGION" != "$AWS_REGION" ]; then
-       echo "❌ Error: Bucket exists, but in a different region ($BUCKET_REGION instead of $AWS_REGION)." | tee -a "$LOG_FILE"
-        exit 1
+        elif echo "$err" | grep -q '403'; then
+            echo "❌ Error: Bucket name exists but you do not have permission to access it." | tee -a "$LOG_FILE"
+            exit 1
+        elif echo "$err" | grep -q '301'; then
+            echo "❌ Error: Bucket exists in a different region. Please check the region." | tee -a "$LOG_FILE"
+            exit 1
+        else
+            echo "❌ Unexpected error from head-bucket: $err" | tee -a "$LOG_FILE"
+            exit 1
+        fi
     fi
 
     # Create JSON file for public access block
@@ -188,6 +187,7 @@ Usage: $0 -b BUCKET_NAME -p AWS_PROFILE [-r AWS_REGION] [-o OAC_NAME]
 Options:
   -b    (Required) S3 Bucket Name
   -p    (Required) AWS Profile (or set AWS_PROFILE in the environment)
+  -P    Make site public (skips IP restriction via WAF)
   -r    AWS Region (default: us-east-1)
   -o    CloudFront OAC Name (default: Derived from Bucket Name)
   -a    alternate domain name
@@ -206,8 +206,10 @@ EOF
 parse_options() {
 ########################################################################
 
+    PUBLIC_SITE=false
+
     # Parse command-line options using `getopt`
-    OPTIONS=$(getopt -o b:p:r:o:a:c:i:t:hT:m: --long bucket:,profile:,region:,oac-name:,alt-domain:,cert-arn:,ip-addresses:,help,default-ttl:,max-ttl: -- "$@")
+    OPTIONS=$(getopt -o b:p:r:o:a:c:i:t:hT:m:P --long bucket:,profile:,region:,oac-name:,alt-domain:,cert-arn:,ip-addresses:,tag-value:,help,default-ttl:,max-ttl:,public -- "$@")
     if [ $? -ne 0 ]; then
         usage
     fi
@@ -218,6 +220,7 @@ parse_options() {
         case "$1" in
             -b | --bucket )       BUCKET_NAME="$2"; shift 2 ;;
             -p | --profile )      AWS_PROFILE="$2"; shift 2 ;;
+            -P | --public )       PUBLIC_SITE=true; shift ;;
             -r | --region )       AWS_REGION="$2"; shift 2 ;;
             -o | --oac-name )     OAC_NAME="$2"; shift 2 ;;
             -a | --alt-domain )   ALT_DOMAIN="$2"; shift 2 ;;
@@ -322,7 +325,7 @@ create_cloudfront_distribution_config() {
     TEMP_FILES+=("$CF_DISTRIBUTION_CONFIG")
 
 
-    if [[ -z "$ALT_DOMAIN" || -z "$CERT_ARN" ]]; then
+    if [[ -z "$ALT_DOMAIN" && -z "$CERT_ARN" ]]; then
         echo "❌ Warn: Both --alt-domain and --cert-arn are required for custom SSL setup. Using defaults CloudFront certificate."
         VIEWER_CERTIFICATE=$(
             cat <<'EOF'
@@ -333,7 +336,16 @@ create_cloudfront_distribution_config() {
  }
 EOF
                           )
-    else
+    elif [[ -n "$ALT_DOMAIN" && -z "$CERT_ARN" ]]; then
+        CERT_ARN=$(aws acm list-certificates --profile "$AWS_PROFILE" \
+                       --query "CertificateSummaryList[?DomainName=='$ALT_DOMAIN']|[0].CertificateArn" \
+                       --output text)
+
+        if test "$CERT_ARN" = "None"; then
+            echo "You must supply a certificate when using an alternate domain...exiting" >&2
+            exit 1
+        fi
+
         VIEWER_CERTIFICATE=$(
             cat <<EOF
  "ViewerCertificate": {
@@ -471,24 +483,25 @@ create_cloudfront_distribution() {
 update_bucket_policy() {
 ########################################################################
 
-    EXISTING_POLICY=$(run_command $AWS s3api get-bucket-policy \
-                           --bucket "$BUCKET_NAME" \
-                           --profile "$AWS_PROFILE" \
-                           --output text 2>>$LOG_FILE || true)
+EXISTING_POLICY=$(
+  $AWS s3api get-bucket-policy \
+    --bucket "$BUCKET_NAME" \
+    --profile "$AWS_PROFILE" \
+    --output text 2>>"$LOG_FILE"
+) || true
 
-    if [ -n "$EXISTING_POLICY" ]; then
-        echo "✅ S3 Bucket Policy already exists. Skipping policy application." | tee -a "$LOG_FILE"
-    else
-        echo "🛠️ Applying S3 Bucket Policy..." | tee -a "$LOG_FILE"
 
-        BUCKET_POLICY=$(mktemp)
-        TEMP_FILES+=("$BUCKET_POLICY")
+if echo "$EXISTING_POLICY" | grep -q "$DISTRIBUTION_ID"; then
+    echo "✅ S3 Bucket Policy already allows this CloudFront distribution. Skipping." | tee -a "$LOG_FILE"
+else
+    echo "🛠️ Applying S3 Bucket Policy..." | tee -a "$LOG_FILE"
 
-        # Update S3 Bucket Policy to Restrict Access
-        echo "🔒 Updating S3 bucket policy to restrict access to CloudFront Distribution..."
+    BUCKET_POLICY=$(mktemp)
+    TEMP_FILES+=("$BUCKET_POLICY")
 
-        BUCKET_POLICY=$(mktemp)
-        cat > "$BUCKET_POLICY" <<EOF
+    echo "🔒 Updating S3 bucket policy to restrict access to CloudFront Distribution..."
+
+    cat > "$BUCKET_POLICY" <<EOF
 {
   "Version": "2012-10-17",
   "Statement": [
@@ -508,12 +521,12 @@ update_bucket_policy() {
   ]
 }
 EOF
-        run_command $AWS s3api put-bucket-policy \
-             --bucket $BUCKET_NAME \
-             --policy file://$BUCKET_POLICY \
-             --profile $AWS_PROFILE
-    fi
 
+    run_command $AWS s3api put-bucket-policy \
+         --bucket "$BUCKET_NAME" \
+         --policy file://$BUCKET_POLICY \
+         --profile $AWS_PROFILE
+fi
 }
 
 ########################################################################
@@ -760,14 +773,18 @@ create_cloudfront_distribution
 # step 3.
 update_bucket_policy
 
-# step 4.
-create_waf_ipset
+if [ "$PUBLIC_SITE" = false ]; then
+  # step 4.
+  create_waf_ipset
 
-# step 5.
-create_waf_web_acl
+  # step 5.
+  create_waf_web_acl
 
-# step 6.
-update_cloudfront_distribution
+  # step 6.
+  update_cloudfront_distribution
+else
+  echo "🌐 Public site mode: skipping WAF IP restrictions." | tee -a "$LOG_FILE"
+fi
 
 # step 7.
 tag_cloudfront_distribution
@@ -776,4 +793,6 @@ echo "🚀 Deployment Summary:"
 echo "   ✅ S3 Bucket: $BUCKET_NAME"
 echo "   ✅ CloudFront Domain: https://$CF_DOMAIN_NAME"
 echo "   ✅ CloudFront Distribution ID: $DISTRIBUTION_ID"
-echo "   ✅ WAF WebACL ARN: $WEB_ACL_ARN"
+if test "$PUBLIC_SITE" = "false"; then
+    echo "   ✅ WAF WebACL ARN: $WEB_ACL_ARN"
+fi

@@ -1,5 +1,26 @@
+Mon May 12 14:20:59 2025  Rob Lauer  <rlauer6@comcast.net>
+
+	[0.02]:
+	* README.md
+	* create-route53-alias.sh: new
+	* delete-s3-static-site.sh: new
+	* request-certificate.sh: new
+	* s3-static-site.sh
+	- added -P option to create public site
+	- lookup cert if ARN not provided
+	(create_s3_bucket)
+	- wait for bucket to become stable before proceeding
+	(update_bucket_polic)
+	- fix failing function when policy does not exist
+	* update-route53.sh
+	- add cloudfront account profile
+	- only try to get distribution id if it is not provided
+	- allow public DNS
+	(get_cloudfront_dns_name): add profile argument
+
 Wed Feb 19 13:54:29 2025  Rob Lauer  <rlauer6@comcast.net>
 
+	[0.01]:
 	* README.md
 	* s3-static-site.sh: renamed from s3-static-site
 	* update-route53.sh: rename from update-route53
