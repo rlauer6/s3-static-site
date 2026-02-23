@@ -26,7 +26,7 @@ HOME_IP=""
 BUCKET=""
 VPC_ID=""
 PROFILE=""
-DRY_RUN=false
+DRY_RUN=""
 
 AWS=$(command -v aws)
 
@@ -48,7 +48,7 @@ while getopts ":i:b:v:p:n" opt; do
     b ) BUCKET="$OPTARG" ;;
     v ) VPC_ID="$OPTARG" ;;
     p ) PROFILE="$OPTARG" ;;
-    n ) DRY_RUN=true ;;
+    n ) DRY_RUN="1" ;;
     * ) usage ;;
   esac
 done
